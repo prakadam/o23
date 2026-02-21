@@ -1,0 +1,581 @@
+# Databricks notebook source
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC # SHAP Analysis — Completed vs Not Completed
+# MAGIC
+# MAGIC ### Segments
+# MAGIC | # | Segment | Filter |
+# MAGIC |---|---------|--------|
+# MAGIC | 1 | MA — All Periods | `MA_Visitor == 1` |
+# MAGIC | 2 | MS — All Periods | `MS_Visitor == 1` |
+# MAGIC | 3 | SNP — All Periods | `SNP_Visitor == 1` |
+# MAGIC | 4 | MA — During AEP | `MA_Visitor == 1` & `during_aep == 1` |
+# MAGIC
+# MAGIC ### Model
+# MAGIC - Model 1: XGBoost — Completed vs Not Completed
+# MAGIC - Label: `Ole_Completed_Flag`
+# MAGIC - SHAP computed once on full test set, then sliced per segment
+
+# COMMAND ----------
+
+# MAGIC %pip install shap
+
+# COMMAND ----------
+
+import numpy as np
+import pandas as pd
+import shap
+import xgboost as xgb
+import matplotlib.pyplot as plt
+import matplotlib
+import pickle
+import warnings
+warnings.filterwarnings('ignore')
+
+matplotlib.rcParams.update({
+    'font.size': 11,
+    'font.family': 'sans-serif',
+    'axes.titlesize': 14,
+    'axes.titleweight': 'bold',
+    'figure.facecolor': 'white',
+    'axes.facecolor': 'white',
+})
+
+MODEL_NAME = 'pre_ole'
+DATA_DIR = '/dbfs/FileStore/ole_model/'
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Step 1: Load Model & Test Data
+
+# COMMAND ----------
+
+# --- Load your trained XGBoost model ---
+# Adjust path/method to match how you saved it
+# Option A: pickle
+# with open(f'{DATA_DIR}xgb_model_{MODEL_NAME}.pkl', 'rb') as f:
+#     model = pickle.load(f)
+
+# Option B: xgboost native
+# model = xgb.Booster()
+# model.load_model(f'{DATA_DIR}xgb_model_{MODEL_NAME}.json')
+
+# Option C: if model is already in memory from previous cells
+# model = model  # already loaded
+
+print(f"✓ Model loaded")
+
+# --- Load test data ---
+# Adjust to match your actual test dataframe
+# test_df should have ALL columns including MA_Visitor, MS_Visitor, SNP_Visitor, during_aep
+# X_test should have only the FEATURE columns (no label, no ID, no segment flags)
+
+# Option A: from parquet
+# test_df = pd.read_parquet(f'{DATA_DIR}{MODEL_NAME}_test.parquet')
+
+# Option B: if already in memory
+# test_df = test_df  # already loaded
+
+print(f"✓ Test data: {len(test_df):,} rows")
+print(f"  Columns: {list(test_df.columns)[:10]}...")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Step 2: Define Features & Segments
+
+# COMMAND ----------
+
+# --- Label ---
+LABEL_COL = 'Ole_Completed_Flag'
+
+# --- Segment columns (keep these BEFORE dropping non-feature cols) ---
+SEGMENT_COLS = ['MA_Visitor', 'MS_Visitor', 'SNP_Visitor', 'during_aep']
+
+# Verify segment columns exist
+for col in SEGMENT_COLS:
+    if col in test_df.columns:
+        print(f"  ✓ {col}: {test_df[col].sum():,} users flagged")
+    else:
+        print(f"  ⚠ {col}: NOT FOUND — check column name")
+
+# --- Save segment masks BEFORE creating X_test ---
+seg_MA       = test_df['MA_Visitor'] == 1
+seg_MS       = test_df['MS_Visitor'] == 1
+seg_SNP      = test_df['SNP_Visitor'] == 1
+seg_AEP      = test_df['during_aep'] == 1
+seg_MA_AEP   = seg_MA & seg_AEP
+
+segments = {
+    'MA - All Periods':  seg_MA,
+    'MS - All Periods':  seg_MS,
+    'SNP - All Periods': seg_SNP,
+    'MA - During AEP':   seg_MA_AEP,
+}
+
+# --- Print segment sizes and completion rates ---
+print(f"\n{'='*60}")
+print("SEGMENT OVERVIEW")
+print(f"{'='*60}")
+print(f"{'Segment':<25} | {'Users':>7} | {'Completed':>9} | {'Rate':>6}")
+print("-"*60)
+for name, mask in segments.items():
+    n = mask.sum()
+    if n > 0:
+        completed = test_df.loc[mask, LABEL_COL].sum()
+        rate = completed / n * 100
+        print(f"{name:<25} | {n:>7,} | {completed:>9,.0f} | {rate:>5.1f}%")
+    else:
+        print(f"{name:<25} | {'EMPTY':>7} |           |      ")
+
+# COMMAND ----------
+
+# --- Define feature columns ---
+# Drop non-feature columns to create X_test
+# Adjust this list to match your actual non-feature columns
+NON_FEATURE_COLS = [
+    'mcid', 'label', LABEL_COL,
+    'MA_Visitor', 'MS_Visitor', 'SNP_Visitor',
+    'MA_Ole', 'MS_Ole', 'SNP_Ole',
+    'during_aep', 'pre_aep', 'warm_aep',
+    'ole_started_count', 'ole_completed_count',
+    'Ole_Started_Flag',
+    'page_ids', 'time_deltas', 'page_sequence_raw',
+    'page_set', 'page_data', 'pages_ordered',
+    'first_visit_date', 'last_visit_date',
+    'segment',
+]
+
+# Only drop columns that actually exist
+drop_cols = [c for c in NON_FEATURE_COLS if c in test_df.columns]
+X_test = test_df.drop(columns=drop_cols, errors='ignore')
+
+# Remove any remaining non-numeric columns
+X_test = X_test.select_dtypes(include=[np.number])
+
+print(f"\nFeature columns ({len(X_test.columns)}):")
+for i, col in enumerate(X_test.columns):
+    print(f"  {i+1:>2}. {col}")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Step 3: Compute SHAP (Once)
+
+# COMMAND ----------
+
+print("Computing SHAP values on full test set...")
+print(f"  Users: {len(X_test):,}")
+print(f"  Features: {len(X_test.columns)}")
+
+explainer = shap.TreeExplainer(model)
+shap_values = explainer.shap_values(X_test)
+
+print(f"✓ SHAP computed. Shape: {shap_values.shape}")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Step 4: Full Test Set SHAP (Baseline)
+
+# COMMAND ----------
+
+# --- Beeswarm: Full test set ---
+fig, ax = plt.subplots(figsize=(12, 10))
+shap.summary_plot(
+    shap_values,
+    X_test,
+    max_display=25,
+    show=False,
+    plot_size=(12, 10),
+)
+plt.title("SHAP — All Users (Completed vs Not)", fontsize=14, fontweight='bold', pad=15)
+plt.xlabel("SHAP Value (impact on prediction)", fontsize=12)
+plt.tight_layout()
+plt.savefig(f'{DATA_DIR}shap_all_users_{MODEL_NAME}.png', dpi=200, bbox_inches='tight')
+plt.show()
+print(f"✓ Saved full test set SHAP")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Step 5: SHAP Per Segment — Beeswarm Plots
+
+# COMMAND ----------
+
+def shorten(name, max_len=40):
+    """Shorten feature names for readability."""
+    name = (name
+            .replace('pg_VPP:', 'VPP:')
+            .replace('pg_shop:', 'Shop:')
+            .replace('pg_PRE:', 'PRE:')
+            .replace('_visits', '_vis')
+            .replace('_Visitor', '_Vis'))
+    return name[:max_len] + '..' if len(name) > max_len else name
+
+
+for name, mask in segments.items():
+    n = mask.sum()
+    if n < 30:
+        print(f"\n⚠ Skipping {name} — only {n} users (need 30+)")
+        continue
+
+    mask_idx = mask.values
+
+    fig, ax = plt.subplots(figsize=(12, 9))
+    shap.summary_plot(
+        shap_values[mask_idx],
+        X_test[mask_idx],
+        max_display=20,
+        show=False,
+        plot_size=(12, 9),
+    )
+    completed_n = test_df.loc[mask, LABEL_COL].sum()
+    plt.title(f"SHAP — {name}\n(n={n:,} | {completed_n:,.0f} completed | {completed_n/n*100:.1f}%)",
+              fontsize=14, fontweight='bold', pad=15)
+    plt.xlabel("SHAP Value", fontsize=12)
+    plt.tight_layout()
+
+    safe_name = name.replace(' ', '_').replace('—', '').replace('-', '_').strip('_')
+    plt.savefig(f'{DATA_DIR}shap_beeswarm_{safe_name}_{MODEL_NAME}.png',
+                dpi=200, bbox_inches='tight')
+    plt.show()
+    print(f"✓ {name}: {n:,} users")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Step 6: SHAP Per Segment — Clean Bar Plots
+
+# COMMAND ----------
+
+for name, mask in segments.items():
+    n = mask.sum()
+    if n < 30:
+        continue
+
+    mask_idx = mask.values
+    seg_shap = shap_values[mask_idx]
+
+    # Mean |SHAP| per feature
+    mean_abs = np.abs(seg_shap).mean(axis=0)
+    TOP_N = 20
+    top_idx = np.argsort(mean_abs)[-TOP_N:]
+    top_vals = mean_abs[top_idx]
+    top_names = [shorten(X_test.columns[i]) for i in top_idx]
+
+    colors = plt.cm.Blues(np.linspace(0.3, 0.9, TOP_N))
+
+    fig, ax = plt.subplots(figsize=(11, 8))
+    bars = ax.barh(range(TOP_N), top_vals, color=colors, edgecolor='white', height=0.7)
+
+    for bar, val in zip(bars, top_vals):
+        ax.text(bar.get_width() + max(top_vals) * 0.01,
+                bar.get_y() + bar.get_height() / 2,
+                f'{val:.3f}', va='center', ha='left', fontsize=9, color='#333')
+
+    ax.set_yticks(range(TOP_N))
+    ax.set_yticklabels(top_names, fontsize=10)
+    ax.set_xlabel('Mean |SHAP Value|', fontsize=12)
+
+    completed_n = test_df.loc[mask, LABEL_COL].sum()
+    ax.set_title(f"Top Features — {name}\n(n={n:,} | {completed_n:,.0f} completed | {completed_n/n*100:.1f}%)",
+                 fontsize=14, fontweight='bold', pad=15)
+    ax.spines['top'].set_visible(False)
+    ax.spines['right'].set_visible(False)
+    ax.grid(axis='x', alpha=0.2)
+    ax.grid(axis='y', visible=False)
+
+    plt.tight_layout()
+    safe_name = name.replace(' ', '_').replace('—', '').replace('-', '_').strip('_')
+    plt.savefig(f'{DATA_DIR}shap_bar_{safe_name}_{MODEL_NAME}.png',
+                dpi=200, bbox_inches='tight')
+    plt.show()
+    print(f"✓ Bar plot: {name}")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Step 7: Side-by-Side Comparison — MA vs MS vs SNP
+
+# COMMAND ----------
+
+plan_segments = {
+    'MA': seg_MA,
+    'MS': seg_MS,
+    'SNP': seg_SNP,
+}
+
+# Compute mean |SHAP| per plan
+plan_importance = {}
+for plan_name, mask in plan_segments.items():
+    if mask.sum() < 30:
+        print(f"⚠ Skipping {plan_name} — only {mask.sum()} users")
+        continue
+    plan_importance[plan_name] = np.abs(shap_values[mask.values]).mean(axis=0)
+
+if len(plan_importance) >= 2:
+    # Union of top 15 features across all plans
+    top_features_set = set()
+    for vals in plan_importance.values():
+        for i in np.argsort(vals)[-15:]:
+            top_features_set.add(i)
+
+    # Sort by max importance across any plan
+    top_features = sorted(top_features_set,
+                          key=lambda i: max(v[i] for v in plan_importance.values()))
+
+    n_plans = len(plan_importance)
+    bar_height = 0.8 / n_plans
+    plan_colors = {'MA': '#2196F3', 'MS': '#4CAF50', 'SNP': '#FF9800'}
+
+    fig, ax = plt.subplots(figsize=(13, max(7, len(top_features) * 0.45)))
+
+    for j, (plan_name, vals) in enumerate(plan_importance.items()):
+        positions = [i + j * bar_height for i in range(len(top_features))]
+        values = [vals[fi] for fi in top_features]
+        ax.barh(positions, values, height=bar_height,
+                label=f"{plan_name} (n={plan_segments[plan_name].sum():,})",
+                color=plan_colors.get(plan_name, '#999'),
+                edgecolor='white', alpha=0.85)
+
+    ax.set_yticks([i + bar_height * (n_plans - 1) / 2 for i in range(len(top_features))])
+    ax.set_yticklabels([shorten(X_test.columns[fi]) for fi in top_features], fontsize=10)
+    ax.set_xlabel('Mean |SHAP Value|', fontsize=12)
+    ax.set_title('Feature Importance Comparison: MA vs MS vs SNP\n(Completed vs Not Completed)',
+                 fontsize=14, fontweight='bold', pad=15)
+    ax.legend(fontsize=11, loc='lower right')
+    ax.spines['top'].set_visible(False)
+    ax.spines['right'].set_visible(False)
+    ax.grid(axis='x', alpha=0.2)
+    ax.grid(axis='y', visible=False)
+
+    plt.tight_layout()
+    plt.savefig(f'{DATA_DIR}shap_MA_vs_MS_vs_SNP_{MODEL_NAME}.png',
+                dpi=200, bbox_inches='tight')
+    plt.show()
+    print("✓ Saved MA vs MS vs SNP comparison")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Step 8: MA All Periods vs MA During AEP
+
+# COMMAND ----------
+
+ma_segments = {
+    'MA - All Periods': seg_MA,
+    'MA - During AEP':  seg_MA_AEP,
+}
+
+ma_importance = {}
+for seg_name, mask in ma_segments.items():
+    if mask.sum() < 30:
+        continue
+    ma_importance[seg_name] = np.abs(shap_values[mask.values]).mean(axis=0)
+
+if len(ma_importance) == 2:
+    top_features_set = set()
+    for vals in ma_importance.values():
+        for i in np.argsort(vals)[-15:]:
+            top_features_set.add(i)
+
+    top_features = sorted(top_features_set,
+                          key=lambda i: max(v[i] for v in ma_importance.values()))
+
+    bar_height = 0.35
+    ma_colors = {'MA - All Periods': '#2196F3', 'MA - During AEP': '#F44336'}
+
+    fig, ax = plt.subplots(figsize=(13, max(7, len(top_features) * 0.45)))
+
+    for j, (seg_name, vals) in enumerate(ma_importance.items()):
+        positions = [i + j * bar_height for i in range(len(top_features))]
+        values = [vals[fi] for fi in top_features]
+        mask = ma_segments[seg_name]
+        ax.barh(positions, values, height=bar_height,
+                label=f"{seg_name} (n={mask.sum():,})",
+                color=ma_colors.get(seg_name, '#999'),
+                edgecolor='white', alpha=0.85)
+
+    ax.set_yticks([i + bar_height / 2 for i in range(len(top_features))])
+    ax.set_yticklabels([shorten(X_test.columns[fi]) for fi in top_features], fontsize=10)
+    ax.set_xlabel('Mean |SHAP Value|', fontsize=12)
+    ax.set_title('MA: All Periods vs During AEP\n(Completed vs Not Completed)',
+                 fontsize=14, fontweight='bold', pad=15)
+    ax.legend(fontsize=11, loc='lower right')
+    ax.spines['top'].set_visible(False)
+    ax.spines['right'].set_visible(False)
+    ax.grid(axis='x', alpha=0.2)
+    ax.grid(axis='y', visible=False)
+
+    plt.tight_layout()
+    plt.savefig(f'{DATA_DIR}shap_MA_all_vs_AEP_{MODEL_NAME}.png',
+                dpi=200, bbox_inches='tight')
+    plt.show()
+    print("✓ Saved MA All vs AEP comparison")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Step 9: Top Features Comparison Table
+
+# COMMAND ----------
+
+def get_top_features(shap_vals, feature_names, top_n=10):
+    mean_abs = np.abs(shap_vals).mean(axis=0)
+    top_idx = np.argsort(mean_abs)[-top_n:][::-1]
+    return [(feature_names[i], round(float(mean_abs[i]), 4)) for i in top_idx]
+
+
+feature_names = X_test.columns.tolist()
+all_segments = {**segments}  # all 4 segments
+
+print(f"\n{'='*90}")
+print("TOP 10 FEATURES PER SEGMENT")
+print(f"{'='*90}")
+
+comparison_rows = []
+
+for name, mask in all_segments.items():
+    n = mask.sum()
+    if n < 30:
+        continue
+
+    top = get_top_features(shap_values[mask.values], feature_names, top_n=10)
+
+    completed_n = test_df.loc[mask, LABEL_COL].sum()
+    print(f"\n--- {name} (n={n:,} | {completed_n:,.0f} completed | {completed_n/n*100:.1f}%) ---")
+    print(f"  {'Rank':>4} | {'Feature':<50} | {'Mean |SHAP|':>11}")
+    print(f"  {'-'*70}")
+
+    for rank, (feat, val) in enumerate(top, 1):
+        print(f"  {rank:>4} | {feat:<50} | {val:>11.4f}")
+        comparison_rows.append({
+            'segment': name,
+            'rank': rank,
+            'feature': feat,
+            'mean_abs_shap': val,
+        })
+
+# Save
+comp_df = pd.DataFrame(comparison_rows)
+comp_df.to_csv(f'{DATA_DIR}shap_segment_comparison_{MODEL_NAME}.csv', index=False)
+print(f"\n✓ Saved shap_segment_comparison_{MODEL_NAME}.csv")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Step 10: Presentation-Ready Top 10 Per Segment
+
+# COMMAND ----------
+
+def get_color(name):
+    """Color by feature category."""
+    n = name.lower()
+    if any(k in n for k in ['visit', 'depth', 'time', 'seq', 'length', 'days', 'count']):
+        return '#2196F3'   # blue = behavioral
+    elif any(k in n for k in ['vpp', 'shop', 'dce', 'pg_']):
+        return '#4CAF50'   # green = page presence
+    elif any(k in n for k in ['member', 'shopper', 'auth']):
+        return '#FF9800'   # orange = user attributes
+    else:
+        return '#9E9E9E'   # gray
+
+
+from matplotlib.patches import Patch
+
+for name, mask in all_segments.items():
+    n = mask.sum()
+    if n < 30:
+        continue
+
+    mask_idx = mask.values
+    seg_shap = shap_values[mask_idx]
+    mean_abs = np.abs(seg_shap).mean(axis=0)
+
+    TOP_N = 10
+    top_idx = np.argsort(mean_abs)[-TOP_N:]
+    top_vals = mean_abs[top_idx]
+    top_names_full = [X_test.columns[i] for i in top_idx]
+    top_names = [shorten(n, 45) for n in top_names_full]
+    bar_colors = [get_color(n) for n in top_names_full]
+
+    fig, ax = plt.subplots(figsize=(10, 6))
+    bars = ax.barh(range(TOP_N), top_vals, color=bar_colors, edgecolor='white', height=0.65)
+
+    for bar, val in zip(bars, top_vals):
+        ax.text(bar.get_width() + max(top_vals) * 0.02,
+                bar.get_y() + bar.get_height() / 2,
+                f'{val:.3f}', va='center', ha='left', fontsize=11,
+                fontweight='bold', color='#333')
+
+    ax.set_yticks(range(TOP_N))
+    ax.set_yticklabels(top_names, fontsize=11)
+    ax.set_xlabel('Mean |SHAP Value|', fontsize=12)
+
+    completed_n = test_df.loc[mask, LABEL_COL].sum()
+    ax.set_title(f"Top 10 Drivers: {name}\n(n={n:,} | {completed_n:,.0f} completed | {completed_n/n*100:.1f}%)",
+                 fontsize=14, fontweight='bold', pad=20)
+    ax.spines['top'].set_visible(False)
+    ax.spines['right'].set_visible(False)
+    ax.spines['left'].set_visible(False)
+    ax.tick_params(axis='y', length=0)
+    ax.grid(axis='x', alpha=0.15)
+    ax.grid(axis='y', visible=False)
+
+    legend_items = [
+        Patch(facecolor='#2196F3', label='Behavioral'),
+        Patch(facecolor='#4CAF50', label='Page Visits'),
+        Patch(facecolor='#FF9800', label='User Attributes'),
+    ]
+    ax.legend(handles=legend_items, loc='lower right', fontsize=10, framealpha=0.8)
+
+    plt.tight_layout()
+    safe_name = name.replace(' ', '_').replace('—', '').replace('-', '_').strip('_')
+    plt.savefig(f'{DATA_DIR}shap_top10_{safe_name}_{MODEL_NAME}.png',
+                dpi=250, bbox_inches='tight')
+    plt.show()
+    print(f"✓ Presentation plot: {name}")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Summary
+
+# COMMAND ----------
+
+print("="*60)
+print("FILES SAVED")
+print("="*60)
+print(f"""
+Beeswarm Plots (detailed, shows direction):
+  shap_all_users_{MODEL_NAME}.png
+  shap_beeswarm_MA_All_Periods_{MODEL_NAME}.png
+  shap_beeswarm_MS_All_Periods_{MODEL_NAME}.png
+  shap_beeswarm_SNP_All_Periods_{MODEL_NAME}.png
+  shap_beeswarm_MA_During_AEP_{MODEL_NAME}.png
+
+Bar Plots (clean, ranked):
+  shap_bar_MA_All_Periods_{MODEL_NAME}.png
+  shap_bar_MS_All_Periods_{MODEL_NAME}.png
+  shap_bar_SNP_All_Periods_{MODEL_NAME}.png
+  shap_bar_MA_During_AEP_{MODEL_NAME}.png
+
+Comparison Plots:
+  shap_MA_vs_MS_vs_SNP_{MODEL_NAME}.png
+  shap_MA_all_vs_AEP_{MODEL_NAME}.png
+
+Presentation (Top 10, color-coded):
+  shap_top10_MA_All_Periods_{MODEL_NAME}.png
+  shap_top10_MS_All_Periods_{MODEL_NAME}.png
+  shap_top10_SNP_All_Periods_{MODEL_NAME}.png
+  shap_top10_MA_During_AEP_{MODEL_NAME}.png
+
+Data:
+  shap_segment_comparison_{MODEL_NAME}.csv
+
+✓ DONE
+""")
