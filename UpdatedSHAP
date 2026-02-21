@@ -1,0 +1,406 @@
+# Databricks notebook source
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC # XGBoost + SHAP — Journey Conversion Analysis
+# MAGIC
+# MAGIC ### Models — Completed vs Not Completed
+# MAGIC | Model | Population | Filter |
+# MAGIC |-------|-----------|--------|
+# MAGIC | Model 1-MA | MA visitors | `MA_Visitor == 1` |
+# MAGIC | Model 1-MS | MS visitors | `MS_Visitor == 1` |
+# MAGIC | Model 1-SNP | SNP visitors | `SNP_Visitor == 1` |
+# MAGIC | Model 1-MA-AEP | MA during AEP | `MA_Visitor == 1` & `during_aep == 1` |
+# MAGIC
+# MAGIC Features: per-page (visits + time) + static + derived
+
+# COMMAND ----------
+
+import numpy as np
+import pandas as pd
+import xgboost as xgb
+import shap
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import classification_report, roc_auc_score, confusion_matrix
+import matplotlib.pyplot as plt
+
+MODEL_NAME = 'pre_ole'
+DATA_DIR = '/dbfs/FileStore/ole_model/'
+
+# COMMAND ----------
+
+# ============================================================================
+# COLUMN MAPPING (same as journey analysis notebook)
+# ============================================================================
+
+COL_MCID         = 'mcid'
+COL_SEQ_RAW      = 'page_sequence_raw'
+
+COL_OLE_START_CT = 'ole_started_count'
+COL_OLE_COMP_CT  = 'ole_completed_count'
+COL_OLE_START_FL = 'ole_started_flag'
+COL_OLE_COMP_FL  = 'ole_completed_flag'
+
+COL_VISIT_COUNT  = 'visit_count'
+COL_SEQ_LEN      = 'sequence_length'
+COL_UNIQUE_PAGES = 'unique_pages'
+COL_AVG_DEPTH    = 'avg_visit_depth'
+COL_DCE          = 'dce_used'
+COL_MEMBER       = 'member_flag'
+COL_SHOPPER      = 'shopper_profile'
+COL_SHOPPER_AUTH = 'shopper_profile_auth'
+COL_INVOCA       = 'invoca_calls'
+COL_CHAT_REACT   = 'chat_reactive_clicks'
+COL_CHAT_PROACT  = 'chat_proactive_yes'
+COL_DAYS         = 'days_in_research_phase'
+
+STRUCT_POSITION  = 'seq_position'
+STRUCT_PAGE      = 'new_page_name'
+STRUCT_TIME      = 'time_delta_capped'
+
+# Static features for XGBoost (NO ole fields — those leak)
+STATIC_FEATURES = [
+    COL_VISIT_COUNT, COL_SEQ_LEN, COL_UNIQUE_PAGES, COL_AVG_DEPTH,
+    COL_DCE, COL_MEMBER, COL_SHOPPER, COL_SHOPPER_AUTH,
+    COL_INVOCA, COL_CHAT_REACT, COL_CHAT_PROACT, COL_DAYS
+]
+
+# --- Segment columns (for filtering, NOT used as features) ---
+COL_MA_VISITOR  = 'MA_Visitor'
+COL_MS_VISITOR  = 'MS_Visitor'
+COL_SNP_VISITOR = 'SNP_Visitor'
+COL_DURING_AEP  = 'during_aep'
+
+# COMMAND ----------
+
+# ============================================================================
+# STEP 1: ENSURE page_data EXISTS
+# ============================================================================
+# If you already ran the journey analysis notebook, page_data is ready.
+# If not, this cell extracts it.
+
+if 'page_data' not in page_clickstream_data.columns:
+    print("Extracting page_data from page_sequence_raw...")
+
+    def extract_from_raw_sequence(seq_raw):
+        if not seq_raw:
+            return {}, 0.0
+        try:
+            sorted_seq = sorted(seq_raw,
+                key=lambda x: x[STRUCT_POSITION] if isinstance(x, dict) else getattr(x, STRUCT_POSITION))
+        except:
+            sorted_seq = seq_raw
+
+        page_data = {}
+        total_time = 0.0
+        for item in sorted_seq:
+            if isinstance(item, dict):
+                page = item.get(STRUCT_PAGE, 'UNK')
+                t = float(item.get(STRUCT_TIME, 0) or 0)
+            else:
+                page = getattr(item, STRUCT_PAGE, 'UNK')
+                t = float(getattr(item, STRUCT_TIME, 0) or 0)
+            total_time += t
+            if page in page_data:
+                page_data[page]['cum_time'] += t
+                page_data[page]['visits'] += 1
+            else:
+                page_data[page] = {'cum_time': t, 'visits': 1}
+        return page_data, total_time
+
+    page_data_list = []
+    total_time_list = []
+    for seq_raw in page_clickstream_data[COL_SEQ_RAW]:
+        pd_, tt_ = extract_from_raw_sequence(seq_raw)
+        page_data_list.append(pd_)
+        total_time_list.append(tt_)
+
+    page_clickstream_data['page_data']  = page_data_list
+    page_clickstream_data['total_time'] = total_time_list
+    print("✓ Extracted")
+else:
+    print("✓ page_data already exists")
+
+# Derived (if not already computed)
+if 'time_per_page' not in page_clickstream_data.columns:
+    page_clickstream_data['time_per_page'] = np.where(
+        page_clickstream_data[COL_UNIQUE_PAGES] > 0,
+        page_clickstream_data['total_time'] / page_clickstream_data[COL_UNIQUE_PAGES], 0)
+    page_clickstream_data['time_per_visit'] = np.where(
+        page_clickstream_data[COL_VISIT_COUNT] > 0,
+        page_clickstream_data['total_time'] / page_clickstream_data[COL_VISIT_COUNT], 0)
+    page_clickstream_data['pages_per_visit'] = np.where(
+        page_clickstream_data[COL_VISIT_COUNT] > 0,
+        page_clickstream_data[COL_SEQ_LEN] / page_clickstream_data[COL_VISIT_COUNT], 0)
+
+DERIVED_FEATURES = ['total_time', 'time_per_page', 'time_per_visit', 'pages_per_visit']
+
+print(f"Shape: {page_clickstream_data.shape}")
+
+# COMMAND ----------
+
+# ============================================================================
+# STEP 2: BUILD FEATURE MATRIX
+# ============================================================================
+# Per-page features: {page}_visits, {page}_time
+# Dynamic — adapts to whatever pages exist in the data
+# ============================================================================
+
+# Discover all unique pages
+all_pages = set()
+for pd_ in page_clickstream_data['page_data']:
+    all_pages.update(pd_.keys())
+all_pages = sorted(all_pages)
+print(f"Unique pages: {len(all_pages)}")
+print(f"  {all_pages}")
+
+# Build per-page feature columns
+page_visits_data = {}
+page_time_data = {}
+
+for page in all_pages:
+    col_visits = f'pg_{page}_visits'
+    col_time = f'pg_{page}_time'
+    page_visits_data[col_visits] = []
+    page_time_data[col_time] = []
+
+for pd_ in page_clickstream_data['page_data']:
+    for page in all_pages:
+        col_visits = f'pg_{page}_visits'
+        col_time = f'pg_{page}_time'
+        if page in pd_:
+            page_visits_data[col_visits].append(pd_[page]['visits'])
+            page_time_data[col_time].append(pd_[page]['cum_time'])
+        else:
+            page_visits_data[col_visits].append(0)
+            page_time_data[col_time].append(0.0)
+
+# Add to dataframe
+for col, vals in {**page_visits_data, **page_time_data}.items():
+    page_clickstream_data[col] = vals
+
+PAGE_FEATURES = [f'pg_{p}_visits' for p in all_pages] + [f'pg_{p}_time' for p in all_pages]
+
+ALL_FEATURES = STATIC_FEATURES + DERIVED_FEATURES + PAGE_FEATURES
+
+print(f"\nFeature count:")
+print(f"  Static:  {len(STATIC_FEATURES)}")
+print(f"  Derived: {len(DERIVED_FEATURES)}")
+print(f"  Page:    {len(PAGE_FEATURES)} ({len(all_pages)} pages × 2)")
+print(f"  Total:   {len(ALL_FEATURES)}")
+
+# COMMAND ----------
+
+# ============================================================================
+# STEP 3: DEFINE TARGETS
+# ============================================================================
+
+# Target: Completed (1) vs not completed (0)
+page_clickstream_data['target_completed'] = (page_clickstream_data[COL_OLE_COMP_CT] >= 1).astype(int)
+
+print("Target distribution:")
+print(f"  Completed: {page_clickstream_data['target_completed'].sum():,}")
+print(f"  Not:       {(page_clickstream_data['target_completed'] == 0).sum():,}")
+print(f"  Rate:      {page_clickstream_data['target_completed'].mean()*100:.1f}%")
+
+# COMMAND ----------
+
+# ============================================================================
+# STEP 4: VERIFY FEATURE MATRIX — no NaN, no inf
+# ============================================================================
+
+X_all = page_clickstream_data[ALL_FEATURES]
+
+print("Feature matrix check:")
+print(f"  Shape: {X_all.shape}")
+print(f"  NaN:   {X_all.isna().sum().sum()}")
+print(f"  Inf:   {np.isinf(X_all.select_dtypes(include=[np.number])).sum().sum()}")
+
+# Fill any NaN/inf
+X_all = X_all.fillna(0).replace([np.inf, -np.inf], 0)
+page_clickstream_data[ALL_FEATURES] = X_all
+
+print("  ✓ Cleaned")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Segment Models: MA, MS, SNP, MA+AEP (Completed vs Not)
+
+# COMMAND ----------
+
+# ============================================================================
+# SEGMENT DEFINITIONS
+# ============================================================================
+
+segments = {
+    'MA': page_clickstream_data[COL_MA_VISITOR] == 1,
+    'MS': page_clickstream_data[COL_MS_VISITOR] == 1,
+    'SNP': page_clickstream_data[COL_SNP_VISITOR] == 1,
+    'MA_AEP': (page_clickstream_data[COL_MA_VISITOR] == 1) & (page_clickstream_data[COL_DURING_AEP] == 1),
+}
+
+print("="*60)
+print("SEGMENT SIZES")
+print("="*60)
+print(f"{'Segment':<15} | {'Total':>8} | {'Completed':>9} | {'Not Comp':>9} | {'Rate':>6}")
+print("-"*60)
+for seg_name, seg_mask in segments.items():
+    seg_df = page_clickstream_data[seg_mask]
+    n_total = len(seg_df)
+    n_comp = seg_df['target_completed'].sum()
+    n_nc = n_total - n_comp
+    rate = n_comp / n_total * 100 if n_total > 0 else 0
+    print(f"{seg_name:<15} | {n_total:>8,} | {n_comp:>9,} | {n_nc:>9,} | {rate:>5.1f}%")
+
+# COMMAND ----------
+
+# ============================================================================
+# HELPER: TRAIN, EVALUATE, SHAP FOR A SEGMENT
+# ============================================================================
+
+def run_segment_model(data, features, target_col, seg_name, data_dir, model_name):
+    """
+    Train XGBoost, evaluate, compute SHAP for a single segment.
+    
+    - Train on 80%, evaluate on 20% (honest AUC/precision/recall)
+    - SHAP on 100% (richer feature insights)
+    """
+    X_all = data[features]
+    y_all = data[target_col]
+    
+    # --- Train/Test Split ---
+    X_train, X_test, y_train, y_test = train_test_split(
+        X_all, y_all, test_size=0.2, random_state=42, stratify=y_all
+    )
+    
+    print(f"\n{'='*60}")
+    print(f"SEGMENT: {seg_name} — Completed vs Not")
+    print(f"{'='*60}")
+    print(f"  Total: {len(X_all):,}")
+    print(f"  Train: {len(X_train):,} ({y_train.mean()*100:.1f}% positive)")
+    print(f"  Test:  {len(X_test):,} ({y_test.mean()*100:.1f}% positive)")
+    
+    # --- Train ---
+    neg_count = (y_train == 0).sum()
+    pos_count = (y_train == 1).sum()
+    
+    mdl = xgb.XGBClassifier(
+        n_estimators=300,
+        max_depth=6,
+        learning_rate=0.05,
+        subsample=0.8,
+        colsample_bytree=0.8,
+        scale_pos_weight=neg_count / pos_count,
+        eval_metric='auc',
+        random_state=42,
+        use_label_encoder=False,
+    )
+    mdl.fit(X_train, y_train, eval_set=[(X_test, y_test)], verbose=50)
+    
+    # --- Evaluate on TEST only (honest metrics) ---
+    y_pred = mdl.predict(X_test)
+    y_prob = mdl.predict_proba(X_test)[:, 1]
+    
+    auc = roc_auc_score(y_test, y_prob)
+    print(f"\nAUC-ROC (test only): {auc:.4f}")
+    print(f"\nClassification Report (test only):")
+    print(classification_report(y_test, y_pred, target_names=['Not Completed', 'Completed']))
+    cm = confusion_matrix(y_test, y_pred)
+    print(f"Confusion Matrix (test only):")
+    print(f"  TN={cm[0,0]:,}  FP={cm[0,1]:,}")
+    print(f"  FN={cm[1,0]:,}  TP={cm[1,1]:,}")
+    
+    # --- SHAP on FULL data (all users in segment) ---
+    print(f"\nComputing SHAP on full {seg_name} data ({len(X_all):,} users)...")
+    explainer = shap.TreeExplainer(mdl)
+    shap_vals = explainer.shap_values(X_all)
+    
+    # Beeswarm
+    shap.summary_plot(shap_vals, X_all, max_display=25, show=False, plot_size=(12, 9))
+    plt.title(f"{seg_name}: Completed vs Not — SHAP Feature Importance\n"
+              f"(SHAP on {len(X_all):,} users | AUC={auc:.4f} on test)",
+              fontsize=13, fontweight='bold', pad=15)
+    plt.tight_layout()
+    plt.savefig(f'{data_dir}{seg_name}_shap_beeswarm_{model_name}.png', dpi=200, bbox_inches='tight')
+    plt.show()
+    
+    # Bar plot
+    shap.summary_plot(shap_vals, X_all, plot_type='bar', max_display=25, show=False, plot_size=(12, 9))
+    plt.title(f"{seg_name}: Mean |SHAP| — Feature Importance\n"
+              f"(SHAP on {len(X_all):,} users)",
+              fontsize=13, fontweight='bold', pad=15)
+    plt.tight_layout()
+    plt.savefig(f'{data_dir}{seg_name}_shap_bar_{model_name}.png', dpi=200, bbox_inches='tight')
+    plt.show()
+    
+    # Feature importance table
+    mean_shap = np.abs(shap_vals).mean(axis=0)
+    fi = pd.DataFrame({
+        'feature': features,
+        'mean_abs_shap': mean_shap
+    }).sort_values('mean_abs_shap', ascending=False)
+    
+    print(f"\n{seg_name} — Top 30 Features by Mean |SHAP|:")
+    print(f"{'Rank':>4} | {'Feature':<45} | {'Mean |SHAP|':>12}")
+    print("-"*70)
+    for i, (_, row) in enumerate(fi.head(30).iterrows()):
+        print(f"{i+1:>4} | {row['feature']:<45} | {row['mean_abs_shap']:>12.4f}")
+    
+    fi.to_csv(f'{data_dir}{seg_name}_feature_importance_{model_name}.csv', index=False)
+    print(f"\n✓ Saved {seg_name} feature importance CSV")
+    
+    return mdl, shap_vals, X_all, y_all, fi, auc
+
+# COMMAND ----------
+
+# ============================================================================
+# RUN ALL SEGMENTS
+# ============================================================================
+
+segment_results = {}
+
+for seg_name, seg_mask in segments.items():
+    seg_data = page_clickstream_data[seg_mask].copy()
+    
+    # Skip if too few completers
+    n_comp = seg_data['target_completed'].sum()
+    if n_comp < 50:
+        print(f"\n⚠ Skipping {seg_name} — only {n_comp} completers (need 50+)")
+        continue
+    
+    mdl, sv, xt, yt, fi, auc = run_segment_model(
+        data=seg_data,
+        features=ALL_FEATURES,
+        target_col='target_completed',
+        seg_name=seg_name,
+        data_dir=DATA_DIR,
+        model_name=MODEL_NAME,
+    )
+    
+    segment_results[seg_name] = {
+        'model': mdl,
+        'shap_values': sv,
+        'X_test': xt,
+        'y_test': yt,
+        'feature_importance': fi,
+        'auc': auc,
+    }
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Summary
+# MAGIC
+# MAGIC | Model | Target | Population |
+# MAGIC |-------|--------|------------|
+# MAGIC | MA | Completed vs Not | MA visitors |
+# MAGIC | MS | Completed vs Not | MS visitors |
+# MAGIC | SNP | Completed vs Not | SNP visitors |
+# MAGIC | MA_AEP | Completed vs Not | MA + During AEP |
+# MAGIC
+# MAGIC ### Per segment:
+# MAGIC - AUC/classification report (test 20%)
+# MAGIC - SHAP beeswarm + bar (full data)
+# MAGIC - Feature importance CSV
