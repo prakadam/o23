@@ -1,0 +1,19 @@
+SEGMENTS = {
+    'MA_AEP': {
+        'filter': (
+            (page_clickstream_data[COL_MA_VISITOR] == 1) &
+            (page_clickstream_data[COL_DURING_AEP] == 1)
+        ),
+        'ole_col': 'MA_Ole',
+    },
+    'MA_ONLY_AEP': {
+        'filter': (
+            (page_clickstream_data[COL_MA_VISITOR] == 1) &
+            (page_clickstream_data[COL_DURING_AEP] == 1) &
+            (page_clickstream_data[COL_MS_VISITOR] == 0) &
+            (page_clickstream_data[COL_SNP_VISITOR] == 0) &
+            (page_clickstream_data[COL_PDP_VISITOR] == 0)
+        ),
+        'ole_col': 'MA_Ole',
+    },
+}
