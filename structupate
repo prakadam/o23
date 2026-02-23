@@ -1,0 +1,20 @@
+@F.udf(returnType=ArrayType(StructType([
+    StructField("seq_position", LongType()),
+    StructField("new_page_name", StringType()),
+    StructField("time_delta_capped", DoubleType()),
+])))
+def clean_sequence_with_time(seq):
+    if not seq:
+        return []
+    valid = [s for s in seq if s is not None]
+    if not valid:
+        return []
+    result = [valid[0]]
+    for item in valid[1:]:
+        if item['new_page_name'] == result[-1]['new_page_name']:
+            result[-1] = (result[-1]['seq_position'],
+                         result[-1]['new_page_name'],
+                         result[-1]['time_delta_capped'] + item['time_delta_capped'])
+        else:
+            result.append(item)
+    return result
