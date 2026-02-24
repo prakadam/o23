@@ -1,0 +1,9 @@
+# Add this right before: pos_journeys = build_journey_report(completed, top_n=25)
+
+needed = ['num_pages', 'page_set_str', 'pages_per_visit', 'total_time', 
+          'time_per_page', 'time_per_visit',
+          COL_VISIT_COUNT, COL_SEQ_LEN, COL_AVG_DEPTH, COL_DCE, 
+          COL_INVOCA, COL_CHAT_REACT, COL_CHAT_PROACT]
+
+for c in needed:
+    print(f"  {'✓' if c in page_clickstream_data.columns else '✗ MISSING'} {c}")
