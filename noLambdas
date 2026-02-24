@@ -1,0 +1,52 @@
+def build_journey_report(data, min_users=100, top_n=25):
+    # Step 1: Top paths only
+    path_counts = data['page_set_str'].value_counts().head(top_n)
+    subset = data[data['page_set_str'].isin(set(path_counts.index))].copy()
+    
+    # Step 2: Simple agg (no lambdas)
+    grouped = subset.groupby('page_set_str').agg({
+        'num_pages': 'first',
+        COL_VISIT_COUNT: ['count', 'median', 'min', 'max'],
+        COL_SEQ_LEN: 'median',
+        'pages_per_visit': 'median',
+        'total_time': ['median', 'mean'],
+        'time_per_page': 'median',
+        'time_per_visit': 'median',
+        COL_AVG_DEPTH: 'median',
+        COL_DCE: 'median',
+        COL_INVOCA: 'median',
+        COL_CHAT_REACT: 'median',
+        COL_CHAT_PROACT: 'median',
+    })
+    
+    # Flatten column names
+    grouped.columns = ['_'.join(c).strip('_') for c in grouped.columns]
+    grouped = grouped.reset_index().rename(columns={'page_set_str': 'page_set'})
+    
+    # Rename to match expected output
+    grouped = grouped.rename(columns={
+        f'{COL_VISIT_COUNT}_count': 'users',
+        f'{COL_VISIT_COUNT}_median': 'median_visits',
+        f'{COL_VISIT_COUNT}_min': 'min_visits',
+        f'{COL_VISIT_COUNT}_max': 'max_visits',
+        'num_pages_first': 'num_pages',
+        f'{COL_SEQ_LEN}_median': 'median_page_hits',
+        'pages_per_visit_median': 'median_pages_per_visit',
+        'total_time_median': 'median_time_min',
+        'total_time_mean': 'avg_time_min',
+        'time_per_page_median': 'median_time_per_page_min',
+        'time_per_visit_median': 'median_time_per_visit_min',
+        f'{COL_AVG_DEPTH}_median': 'median_avg_depth',
+        f'{COL_DCE}_median': 'median_dce',
+        f'{COL_INVOCA}_median': 'median_invoca',
+        f'{COL_CHAT_REACT}_median': 'median_chat_reactive',
+        f'{COL_CHAT_PROACT}_median': 'median_chat_proactive',
+    })
+    
+    # Convert time from seconds to minutes
+    grouped['median_time_min'] = round(grouped['median_time_min'] / 60, 2)
+    grouped['avg_time_min'] = round(grouped['avg_time_min'] / 60, 2)
+    grouped['median_time_per_page_min'] = round(grouped['median_time_per_page_min'] / 60, 3)
+    grouped['median_time_per_visit_min'] = round(grouped['median_time_per_visit_min'] / 60, 2)
+    
+    return grouped.sort_values('users', ascending=False)
