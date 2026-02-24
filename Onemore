@@ -1,0 +1,12 @@
+# P90 calculations
+for col, name in [
+    (COL_VISIT_COUNT, 'p90_visits'),
+    (COL_SEQ_LEN, 'p90_page_hits'),
+    ('total_time', 'p90_time_min'),
+]:
+    p90 = subset.groupby('page_set_str')[col].quantile(0.9).reset_index()
+    p90.columns = ['page_set_str', name]
+    grouped = grouped.merge(p90, on='page_set_str', how='left')
+
+# Convert p90 time to minutes
+grouped['p90_time_min'] = round(grouped['p90_time_min'] / 60, 2)
