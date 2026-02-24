@@ -1,0 +1,31 @@
+# Convert page_set to string for groupby (frozenset isn't groupable)
+page_clickstream_data['page_set_str'] = page_clickstream_data['page_set'].apply(
+    lambda x: ' | '.join(sorted(x)))
+
+# Vectorized groupby — no iterrows
+def build_journey_report(data, min_users=100):
+    grouped = data.groupby('page_set_str').agg(
+        users=('page_set_str', 'count'),
+        num_pages=('num_pages', 'first'),
+        median_visits=(COL_VISIT_COUNT, 'median'),
+        p90_visits=(COL_VISIT_COUNT, lambda x: np.percentile(x, 90)),
+        min_visits=(COL_VISIT_COUNT, 'min'),
+        max_visits=(COL_VISIT_COUNT, 'max'),
+        median_page_hits=(COL_SEQ_LEN, 'median'),
+        p90_page_hits=(COL_SEQ_LEN, lambda x: np.percentile(x, 90)),
+        median_pages_per_visit=('pages_per_visit', 'median'),
+        median_time_min=('total_time', lambda x: round(np.median(x) / 60, 2)),
+        avg_time_min=('total_time', lambda x: round(np.mean(x) / 60, 2)),
+        p90_time_min=('total_time', lambda x: np.percentile(x, 90) / 60),
+        min_time_min=('total_time', lambda x: np.min(x) / 60),
+        max_time_min=('total_time', lambda x: np.max(x) / 60),
+        median_time_per_page_min=('time_per_page', lambda x: round(np.median(x) / 60, 3)),
+        median_time_per_visit_min=('time_per_visit', lambda x: round(np.median(x) / 60, 2)),
+        median_avg_depth=(COL_AVG_DEPTH, 'median'),
+        median_dce=(COL_DCE, 'median'),
+        median_invoca=(COL_INVOCA, 'median'),
+        median_chat_reactive=(COL_CHAT_REACT, 'median'),
+        median_chat_proactive=(COL_CHAT_PROACT, 'median'),
+    ).reset_index().rename(columns={'page_set_str': 'page_set'})
+    
+    return grouped[grouped['users'] >= min_users].sort_values('users', ascending=False)
