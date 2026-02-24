@@ -1,0 +1,13 @@
+# Count users per path, sorted by most common
+path_counts = page_clickstream_data['page_set_str'].value_counts()
+
+# Cumulative percentage
+cum_pct = path_counts.cumsum() / path_counts.sum() * 100
+
+# How many paths cover 80%?
+n_paths_80 = (cum_pct <= 80).sum()
+
+print(f"Total paths: {len(path_counts):,}")
+print(f"Paths to cover 80% users: {n_paths_80:,}")
+print(f"Users in top 80%: {path_counts.head(n_paths_80).sum():,}")
+print(f"Total users: {path_counts.sum():,}")
